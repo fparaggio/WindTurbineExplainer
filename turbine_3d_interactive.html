@@ -880,6 +880,23 @@
                     </div>
                 </div>
             </div>
+
+            <div id="fft-histogram-panel" style="margin-top: 10px;">
+                <h4 style="margin: 10px 0; font-size: 0.95em;">FFT Amplitude Histogram</h4>
+                <div style="margin-bottom: 8px;">
+                    <label style="font-size: 0.9em;">Signal:
+                        <select id="fft-histogram-select" style="margin-left: 6px; padding: 3px 6px;">
+                            <option value="totalThrust">Total Thrust</option>
+                            <option value="totalTorque">Total Torque</option>
+                            <option value="totalNoddingMoment">Total Nodding Moment</option>
+                            <option value="totalYawingMoment">Total Yawing Moment</option>
+                        </select>
+                    </label>
+                </div>
+                <div class="chart-container" style="height: 220px;">
+                    <canvas id="fft-histogram-chart"></canvas>
+                </div>
+            </div>
         </div>
     </div>
     
@@ -1058,6 +1075,40 @@
             samplingInterval: 0,
             speedMultiplier: 5  // Speed up rotation by this factor during fast collection
         };
+
+        // Cache the most recent Fourier results and rendered sections
+        const latestFourierResults = {
+            blade1Thrust: null,
+            blade1MomentY: null,
+            blade1MomentZ: null,
+            blade1AoA: null,
+            blade1Velocity: null,
+            blade1LiftForce: null,
+            totalThrust: null,
+            totalTorque: null,
+            totalMomentY: null,
+            totalMomentZ: null
+        };
+
+        const fourierDisplayCache = {
+            thrust: '',
+            momentY: '',
+            momentZ: '',
+            aoa: '',
+            velocity: '',
+            lift: '',
+            totalThrust: '',
+            totalTorque: '',
+            totalNodding: '',
+            totalYawing: ''
+        };
+
+        const fourierHistogramState = {
+            lastKey: 'totalThrust',
+            lastNonZeroDataByKey: {}
+        };
+
+        let fftHistogramChart = null;
         
         // Wind farm additional turbines
         let additionalTurbines = [];
@@ -3440,7 +3491,25 @@
             updateFourierDisplay();
         }
         
-        // Update Fourier analysis display
+        function hasNonZeroAmplitude(fourier) {
+            return fourier && fourier.some(h => Math.abs(h.amplitude) > 0);
+        }
+
+        function applyFourierSection(element, html, cacheKey, hasSignal) {
+            if (!element) return;
+            if (!hasSignal) {
+                if (fourierDisplayCache[cacheKey]) return; // Keep prior non-zero view
+                element.innerHTML = '<p style="font-size: 0.85em; color: #999;">FFT amplitudes are zero; waiting for non-zero signal...</p>';
+                return;
+            }
+            fourierDisplayCache[cacheKey] = html;
+            element.innerHTML = html;
+        }
+
+        function storeLatestFourier(key, results) {
+            latestFourierResults[key] = results;
+        }
+
         function updateFourierDisplay() {
             const thrustContent = document.getElementById('fourier-thrust-content');
             const momentYContent = document.getElementById('fourier-moment-y-content');
@@ -3491,7 +3560,7 @@
             const totalThrust = fourierData.totalThrust;
             const totalMomentY = fourierData.totalMomentY;
             const totalMomentZ = fourierData.totalMomentZ;
-            
+
             // Perform Fourier analysis (up to 2B, where B = numBlades, minimum 3P)
             const maxHarmonic = Math.max(3, 2 * turbineParams.numBlades);
             const blade1ThrustFourier = analyzeFourier(blade1Thrust, maxHarmonic);
@@ -3500,6 +3569,14 @@
             const totalThrustFourier = analyzeFourier(totalThrust, maxHarmonic);
             const totalMomentYFourier = analyzeFourier(totalMomentY, maxHarmonic);
             const totalMomentZFourier = analyzeFourier(totalMomentZ, maxHarmonic);
+
+            storeLatestFourier('blade1Thrust', blade1ThrustFourier);
+            storeLatestFourier('blade1MomentY', blade1MomentYFourier);
+            storeLatestFourier('blade1MomentZ', blade1MomentZFourier);
+            storeLatestFourier('totalThrust', totalThrustFourier);
+            storeLatestFourier('totalTorque', analyzeFourier(fourierData.totalTorque, maxHarmonic));
+            storeLatestFourier('totalMomentY', totalMomentYFourier);
+            storeLatestFourier('totalMomentZ', totalMomentZFourier);
             
             // Calculate percentages of total
             function calculatePercent(fourier) {
@@ -3543,6 +3620,8 @@
                 return eq;
             }
             
+            const thrustHasSignal = hasNonZeroAmplitude(blade1ThrustFourier) || hasNonZeroAmplitude(totalThrustFourier);
+
             // === THRUST TAB ===
             let thrustHtml = '';
             
@@ -3581,8 +3660,11 @@
                 thrustHtml += '</tr>';
             });
             thrustHtml += '</tbody></table>';
-            
+
+            applyFourierSection(thrustContent, thrustHtml, 'thrust', thrustHasSignal);
+
             // === MOMENT Y TAB === (Shows YAWING, which is Z data)
+            const momentYHasSignal = hasNonZeroAmplitude(blade1MomentZFourier) || hasNonZeroAmplitude(totalMomentZFourier);
             let momentYHtml = '';
             
             // Blade 1 Yawing Moment
@@ -3620,8 +3702,11 @@
                 momentYHtml += '</tr>';
             });
             momentYHtml += '</tbody></table>';
-            
+
+            applyFourierSection(momentYContent, momentYHtml, 'momentY', momentYHasSignal);
+
             // === MOMENT Z TAB === (Shows NODDING, which is Y data)
+            const momentZHasSignal = hasNonZeroAmplitude(blade1MomentYFourier) || hasNonZeroAmplitude(totalMomentYFourier);
             let momentZHtml = '';
             
             // Blade 1 Nodding Moment
@@ -3659,15 +3744,14 @@
                 momentZHtml += '</tr>';
             });
             momentZHtml += '</tbody></table>';
-            
-            thrustContent.innerHTML = thrustHtml;
-            momentYContent.innerHTML = momentYHtml;
-            momentZContent.innerHTML = momentZHtml;
+
+            applyFourierSection(momentZContent, momentZHtml, 'momentZ', momentZHasSignal);
             
             // === AOA TAB === (Blade data only, no total)
             const blade1AoA = fourierData.bladeAoA;
             const blade1AoAFourier = analyzeFourier(blade1AoA, maxHarmonic);
             const blade1AoAWithPercent = calculatePercent(blade1AoAFourier);
+            storeLatestFourier('blade1AoA', blade1AoAFourier);
             
             let aoaHtml = '';
             aoaHtml += '<h5 style="margin: 10px 0 5px 0; font-size: 0.95em;">Blade 1 Angle of Attack (rotating/blade frame)</h5>';
@@ -3686,12 +3770,13 @@
                 aoaHtml += '</tr>';
             });
             aoaHtml += '</tbody></table>';
-            aoaContent.innerHTML = aoaHtml;
+            applyFourierSection(aoaContent, aoaHtml, 'aoa', hasNonZeroAmplitude(blade1AoAFourier));
             
             // === VELOCITY TAB === (Blade data only, no total)
             const blade1Velocity = fourierData.bladeVelocity;
             const blade1VelocityFourier = analyzeFourier(blade1Velocity, maxHarmonic);
             const blade1VelocityWithPercent = calculatePercent(blade1VelocityFourier);
+            storeLatestFourier('blade1Velocity', blade1VelocityFourier);
             
             let velocityHtml = '';
             velocityHtml += '<h5 style="margin: 10px 0 5px 0; font-size: 0.95em;">Blade 1 Total Velocity (rotating/blade frame)</h5>';
@@ -3710,12 +3795,13 @@
                 velocityHtml += '</tr>';
             });
             velocityHtml += '</tbody></table>';
-            velocityContent.innerHTML = velocityHtml;
+            applyFourierSection(velocityContent, velocityHtml, 'velocity', hasNonZeroAmplitude(blade1VelocityFourier));
             
             // === LIFT FORCE TAB === (Blade data only, no total)
             const blade1LiftForce = fourierData.bladeLiftForce;
             const blade1LiftForceFourier = analyzeFourier(blade1LiftForce, maxHarmonic);
             const blade1LiftForceWithPercent = calculatePercent(blade1LiftForceFourier);
+            storeLatestFourier('blade1LiftForce', blade1LiftForceFourier);
             
             let liftHtml = '';
             liftHtml += '<h5 style="margin: 10px 0 5px 0; font-size: 0.95em;">Blade 1 Lift Force (rotating/blade frame)</h5>';
@@ -3734,7 +3820,7 @@
                 liftHtml += '</tr>';
             });
             liftHtml += '</tbody></table>';
-            liftContent.innerHTML = liftHtml;
+            applyFourierSection(liftContent, liftHtml, 'lift', hasNonZeroAmplitude(blade1LiftForceFourier));
             
             // === TOTAL LOADS FOURIER ANALYSIS ===
             const totalThrustContent = document.getElementById('fourier-total-thrust-content');
@@ -3748,17 +3834,27 @@
                 const totalRotorTorque = fourierData.totalTorque;
                 const totalRotorNoddingMoment = fourierData.totalMomentY;  // Use My (nodding)
                 const totalRotorYawingMoment = fourierData.totalMomentZ;  // Use Mz (yawing)
-                
+
                 const totalRotorThrustFourier = analyzeFourier(totalRotorThrust, maxHarmonic);
                 const totalRotorTorqueFourier = analyzeFourier(totalRotorTorque, maxHarmonic);
                 const totalRotorNoddingMomentFourier = analyzeFourier(totalRotorNoddingMoment, maxHarmonic);
                 const totalRotorYawingMomentFourier = analyzeFourier(totalRotorYawingMoment, maxHarmonic);
+
+                storeLatestFourier('totalThrust', totalRotorThrustFourier);
+                storeLatestFourier('totalTorque', totalRotorTorqueFourier);
+                storeLatestFourier('totalMomentY', totalRotorNoddingMomentFourier);
+                storeLatestFourier('totalMomentZ', totalRotorYawingMomentFourier);
                 
                 const totalRotorThrustWithPercent = calculatePercent(totalRotorThrustFourier);
                 const totalRotorTorqueWithPercent = calculatePercent(totalRotorTorqueFourier);
                 const totalRotorNoddingMomentWithPercent = calculatePercent(totalRotorNoddingMomentFourier);
                 const totalRotorYawingMomentWithPercent = calculatePercent(totalRotorYawingMomentFourier);
                 
+                const totalThrustHasSignal = hasNonZeroAmplitude(totalRotorThrustFourier);
+                const totalTorqueHasSignal = hasNonZeroAmplitude(totalRotorTorqueFourier);
+                const totalNoddingHasSignal = hasNonZeroAmplitude(totalRotorNoddingMomentFourier);
+                const totalYawingHasSignal = hasNonZeroAmplitude(totalRotorYawingMomentFourier);
+
                 // Total Thrust
                 let totalThrustHtml = createFourierEquation('Total Thrust', totalRotorThrustFourier);
                 totalThrustHtml += `<div style="margin-top: 10px;">`;
@@ -3770,8 +3866,8 @@
                     totalThrustHtml += `</div>`;
                 });
                 totalThrustHtml += `</div>`;
-                totalThrustContent.innerHTML = totalThrustHtml;
-                
+                applyFourierSection(totalThrustContent, totalThrustHtml, 'totalThrust', totalThrustHasSignal);
+
                 // Total Torque
                 let totalTorqueHtml = createFourierEquation('Total Torque', totalRotorTorqueFourier);
                 totalTorqueHtml += `<div style="margin-top: 10px;">`;
@@ -3783,8 +3879,8 @@
                     totalTorqueHtml += `</div>`;
                 });
                 totalTorqueHtml += `</div>`;
-                totalTorqueContent.innerHTML = totalTorqueHtml;
-                
+                applyFourierSection(totalTorqueContent, totalTorqueHtml, 'totalTorque', totalTorqueHasSignal);
+
                 // Nodding Moment
                 let noddingMomentHtml = createFourierEquation('Nodding Moment', totalRotorNoddingMomentFourier);
                 noddingMomentHtml += `<div style="margin-top: 10px;">`;
@@ -3796,8 +3892,8 @@
                     noddingMomentHtml += `</div>`;
                 });
                 noddingMomentHtml += `</div>`;
-                noddingMomentContent.innerHTML = noddingMomentHtml;
-                
+                applyFourierSection(noddingMomentContent, noddingMomentHtml, 'totalNodding', totalNoddingHasSignal);
+
                 // Yawing Moment
                 let yawingMomentHtml = createFourierEquation('Yawing Moment', totalRotorYawingMomentFourier);
                 yawingMomentHtml += `<div style="margin-top: 10px;">`;
@@ -3809,8 +3905,38 @@
                     yawingMomentHtml += `</div>`;
                 });
                 yawingMomentHtml += `</div>`;
-                yawingMomentContent.innerHTML = yawingMomentHtml;
+                applyFourierSection(yawingMomentContent, yawingMomentHtml, 'totalYawing', totalYawingHasSignal);
             }
+
+            updateFourierHistogram();
+        }
+
+        function updateFourierHistogram() {
+            const selector = document.getElementById('fft-histogram-select');
+            if (!selector || !fftHistogramChart) return;
+
+            const selectedKey = selector.value || fourierHistogramState.lastKey;
+            fourierHistogramState.lastKey = selectedKey;
+
+            const cached = fourierHistogramState.lastNonZeroDataByKey[selectedKey];
+            const fourier = latestFourierResults[selectedKey] || cached;
+            if (!fourier || fourier.length === 0) return;
+
+            if (!hasNonZeroAmplitude(fourier)) {
+                if (cached) {
+                    fftHistogramChart.data.labels = cached.map(h => `${h.harmonic}P`);
+                    fftHistogramChart.data.datasets[0].data = cached.map(h => Number(Math.abs(h.amplitude).toFixed(2)));
+                    fftHistogramChart.update('none');
+                    return;
+                }
+                return;
+            }
+
+            fourierHistogramState.lastNonZeroDataByKey[selectedKey] = fourier;
+
+            fftHistogramChart.data.labels = fourier.map(h => `${h.harmonic}P`);
+            fftHistogramChart.data.datasets[0].data = fourier.map(h => Number(Math.abs(h.amplitude).toFixed(2)));
+            fftHistogramChart.update('none');
         }
         
         // Rebuild charts when blade count changes
@@ -5300,6 +5426,49 @@
                 }
             },
             plugins: [currentPositionPlugin, tdcMarkerPlugin]
+        });
+
+        const fftHistogramSelect = document.getElementById('fft-histogram-select');
+        const fftHistogramCtx = document.getElementById('fft-histogram-chart').getContext('2d');
+        fftHistogramChart = new Chart(fftHistogramCtx, {
+            type: 'bar',
+            data: {
+                labels: [],
+                datasets: [{
+                    label: 'Amplitude',
+                    data: [],
+                    backgroundColor: 'rgba(102, 126, 234, 0.6)',
+                    borderColor: 'rgba(102, 126, 234, 1)',
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                animation: false,
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        callbacks: {
+                            label: (ctx) => `Amplitude: ${ctx.parsed.y}`
+                        }
+                    }
+                },
+                scales: {
+                    x: {
+                        title: { display: true, text: 'Harmonic (nP)' }
+                    },
+                    y: {
+                        beginAtZero: true,
+                        title: { display: true, text: 'Amplitude' }
+                    }
+                }
+            }
+        });
+
+        fftHistogramSelect.addEventListener('change', () => {
+            fourierHistogramState.lastKey = fftHistogramSelect.value;
+            updateFourierHistogram();
         });
         
         // Function to update total loads charts
