@@ -836,6 +836,10 @@
                         <div id="fourier-total-thrust-content"></div>
                     </div>
                 </div>
+                <div class="chart-container" style="height: 220px; margin-top: 10px;">
+                    <h4 style="margin: 10px 0; font-size: 0.95em;">FFT Amplitude Histogram</h4>
+                    <canvas id="thrust-fft-histogram"></canvas>
+                </div>
             </div>
             
             <div id="total-torque-tab" class="trace-tab-content">
@@ -853,8 +857,12 @@
                         <div id="fourier-total-torque-content"></div>
                     </div>
                 </div>
+                <div class="chart-container" style="height: 220px; margin-top: 10px;">
+                    <h4 style="margin: 10px 0; font-size: 0.95em;">FFT Amplitude Histogram</h4>
+                    <canvas id="torque-fft-histogram"></canvas>
+                </div>
             </div>
-            
+
             <div id="total-nodding-moment-tab" class="trace-tab-content">
                 <h4 style="margin: 10px 0; font-size: 0.95em;">Nodding Moment - Inertially-Fixed Reference Frame</h4>
                 <div class="chart-with-fourier">
@@ -866,8 +874,12 @@
                         <div id="fourier-nodding-moment-content"></div>
                     </div>
                 </div>
+                <div class="chart-container" style="height: 220px; margin-top: 10px;">
+                    <h4 style="margin: 10px 0; font-size: 0.95em;">FFT Amplitude Histogram</h4>
+                    <canvas id="nodding-fft-histogram"></canvas>
+                </div>
             </div>
-            
+
             <div id="total-yawing-moment-tab" class="trace-tab-content">
                 <h4 style="margin: 10px 0; font-size: 0.95em;">Yawing Moment - Inertially-Fixed Reference Frame</h4>
                 <div class="chart-with-fourier">
@@ -878,6 +890,10 @@
                         <h4 style="margin-top: 0; font-size: 1em;">Yawing Moment Harmonics</h4>
                         <div id="fourier-yawing-moment-content"></div>
                     </div>
+                </div>
+                <div class="chart-container" style="height: 220px; margin-top: 10px;">
+                    <h4 style="margin: 10px 0; font-size: 0.95em;">FFT Amplitude Histogram</h4>
+                    <canvas id="yawing-fft-histogram"></canvas>
                 </div>
             </div>
 
@@ -1104,11 +1120,10 @@
         };
 
         const fourierHistogramState = {
-            lastKey: 'totalThrust',
             lastNonZeroDataByKey: {}
         };
 
-        let fftHistogramChart = null;
+        let fftHistogramCharts = {};
         
         // Wind farm additional turbines
         let additionalTurbines = [];
@@ -3908,35 +3923,31 @@
                 applyFourierSection(yawingMomentContent, yawingMomentHtml, 'totalYawing', totalYawingHasSignal);
             }
 
-            updateFourierHistogram();
+            updateFourierHistograms();
         }
 
-        function updateFourierHistogram() {
-            const selector = document.getElementById('fft-histogram-select');
-            if (!selector || !fftHistogramChart) return;
+        function updateFourierHistograms() {
+            Object.entries(fftHistogramCharts).forEach(([key, chart]) => {
+                const cached = fourierHistogramState.lastNonZeroDataByKey[key];
+                const fourier = latestFourierResults[key] || cached;
+                if (!fourier || fourier.length === 0) return;
 
-            const selectedKey = selector.value || fourierHistogramState.lastKey;
-            fourierHistogramState.lastKey = selectedKey;
-
-            const cached = fourierHistogramState.lastNonZeroDataByKey[selectedKey];
-            const fourier = latestFourierResults[selectedKey] || cached;
-            if (!fourier || fourier.length === 0) return;
-
-            if (!hasNonZeroAmplitude(fourier)) {
-                if (cached) {
-                    fftHistogramChart.data.labels = cached.map(h => `${h.harmonic}P`);
-                    fftHistogramChart.data.datasets[0].data = cached.map(h => Number(Math.abs(h.amplitude).toFixed(2)));
-                    fftHistogramChart.update('none');
+                if (!hasNonZeroAmplitude(fourier)) {
+                    if (cached) {
+                        chart.data.labels = cached.map(h => `${h.harmonic}P`);
+                        chart.data.datasets[0].data = cached.map(h => Number(Math.abs(h.amplitude).toFixed(2)));
+                        chart.update('none');
+                        return;
+                    }
                     return;
                 }
-                return;
-            }
 
-            fourierHistogramState.lastNonZeroDataByKey[selectedKey] = fourier;
+                fourierHistogramState.lastNonZeroDataByKey[key] = fourier;
 
-            fftHistogramChart.data.labels = fourier.map(h => `${h.harmonic}P`);
-            fftHistogramChart.data.datasets[0].data = fourier.map(h => Number(Math.abs(h.amplitude).toFixed(2)));
-            fftHistogramChart.update('none');
+                chart.data.labels = fourier.map(h => `${h.harmonic}P`);
+                chart.data.datasets[0].data = fourier.map(h => Number(Math.abs(h.amplitude).toFixed(2)));
+                chart.update('none');
+            });
         }
         
         // Rebuild charts when blade count changes
@@ -5428,47 +5439,53 @@
             plugins: [currentPositionPlugin, tdcMarkerPlugin]
         });
 
-        const fftHistogramSelect = document.getElementById('fft-histogram-select');
-        const fftHistogramCtx = document.getElementById('fft-histogram-chart').getContext('2d');
-        fftHistogramChart = new Chart(fftHistogramCtx, {
-            type: 'bar',
-            data: {
-                labels: [],
-                datasets: [{
-                    label: 'Amplitude',
-                    data: [],
-                    backgroundColor: 'rgba(102, 126, 234, 0.6)',
-                    borderColor: 'rgba(102, 126, 234, 1)',
-                    borderWidth: 1
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                animation: false,
-                plugins: {
-                    legend: { display: false },
-                    tooltip: {
-                        callbacks: {
-                            label: (ctx) => `Amplitude: ${ctx.parsed.y}`
+        const fftHistogramConfigs = {
+            totalThrust: { canvasId: 'thrust-fft-histogram', label: 'Total Thrust' },
+            totalTorque: { canvasId: 'torque-fft-histogram', label: 'Total Torque' },
+            totalMomentY: { canvasId: 'nodding-fft-histogram', label: 'Total Nodding Moment' },
+            totalMomentZ: { canvasId: 'yawing-fft-histogram', label: 'Total Yawing Moment' }
+        };
+
+        Object.entries(fftHistogramConfigs).forEach(([key, config]) => {
+            const canvas = document.getElementById(config.canvasId);
+            if (!canvas) return;
+
+            const ctx = canvas.getContext('2d');
+            fftHistogramCharts[key] = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        label: `${config.label} Amplitude`,
+                        data: [],
+                        backgroundColor: 'rgba(102, 126, 234, 0.6)',
+                        borderColor: 'rgba(102, 126, 234, 1)',
+                        borderWidth: 1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            callbacks: {
+                                label: (ctx) => `Amplitude: ${ctx.parsed.y}`
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            title: { display: true, text: 'Harmonic (nP)' }
+                        },
+                        y: {
+                            beginAtZero: true,
+                            title: { display: true, text: 'Amplitude' }
                         }
                     }
-                },
-                scales: {
-                    x: {
-                        title: { display: true, text: 'Harmonic (nP)' }
-                    },
-                    y: {
-                        beginAtZero: true,
-                        title: { display: true, text: 'Amplitude' }
-                    }
                 }
-            }
-        });
-
-        fftHistogramSelect.addEventListener('change', () => {
-            fourierHistogramState.lastKey = fftHistogramSelect.value;
-            updateFourierHistogram();
+            });
         });
         
         // Function to update total loads charts
