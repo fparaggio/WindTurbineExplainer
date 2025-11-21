@@ -516,9 +516,9 @@
                 <div class="info-text">Manual rotor angle control (when paused)</div>
             </div>
             
-            <div class="control-group">
-                <label>Blade Pitch: <span class="value-display" id="blade-pitch-value">5.0</span>°</label>
-                <input type="range" id="blade-pitch" min="-10" max="90" value="5" step="1">
+            <div class="control-group" id="blade-pitch-controls">
+                <label>Blade Pitch (per blade)</label>
+                <div id="blade-pitch-slider-container"></div>
                 <div class="info-text">0° = in disc plane, 90° = fully feathered</div>
                 <button id="twist-settings-btn" style="margin-top: 5px; padding: 5px 10px; background: #667eea; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9em;">⚙️ Twist Settings</button>
             </div>
@@ -836,6 +836,14 @@
                         <div id="fourier-total-thrust-content"></div>
                     </div>
                 </div>
+                <div style="margin: 10px 0; padding: 8px; background: #f5f5f5; border-radius: 6px;">
+                    <h5 style="margin: 0 0 6px 0; font-size: 0.9em;">Per-Blade Instantaneous Thrust</h5>
+                    <div id="blade-thrust-breakdown" style="font-size: 0.85em; display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 6px;"></div>
+                </div>
+                <div class="chart-container" style="height: 220px; margin-top: 10px;">
+                    <h4 style="margin: 10px 0; font-size: 0.95em;">FFT Amplitude Histogram</h4>
+                    <canvas id="thrust-fft-histogram"></canvas>
+                </div>
             </div>
             
             <div id="total-torque-tab" class="trace-tab-content">
@@ -853,8 +861,12 @@
                         <div id="fourier-total-torque-content"></div>
                     </div>
                 </div>
+                <div class="chart-container" style="height: 220px; margin-top: 10px;">
+                    <h4 style="margin: 10px 0; font-size: 0.95em;">FFT Amplitude Histogram</h4>
+                    <canvas id="torque-fft-histogram"></canvas>
+                </div>
             </div>
-            
+
             <div id="total-nodding-moment-tab" class="trace-tab-content">
                 <h4 style="margin: 10px 0; font-size: 0.95em;">Nodding Moment - Inertially-Fixed Reference Frame</h4>
                 <div class="chart-with-fourier">
@@ -866,8 +878,12 @@
                         <div id="fourier-nodding-moment-content"></div>
                     </div>
                 </div>
+                <div class="chart-container" style="height: 220px; margin-top: 10px;">
+                    <h4 style="margin: 10px 0; font-size: 0.95em;">FFT Amplitude Histogram</h4>
+                    <canvas id="nodding-fft-histogram"></canvas>
+                </div>
             </div>
-            
+
             <div id="total-yawing-moment-tab" class="trace-tab-content">
                 <h4 style="margin: 10px 0; font-size: 0.95em;">Yawing Moment - Inertially-Fixed Reference Frame</h4>
                 <div class="chart-with-fourier">
@@ -878,6 +894,10 @@
                         <h4 style="margin-top: 0; font-size: 1em;">Yawing Moment Harmonics</h4>
                         <div id="fourier-yawing-moment-content"></div>
                     </div>
+                </div>
+                <div class="chart-container" style="height: 220px; margin-top: 10px;">
+                    <h4 style="margin: 10px 0; font-size: 0.95em;">FFT Amplitude Histogram</h4>
+                    <canvas id="yawing-fft-histogram"></canvas>
                 </div>
             </div>
         </div>
@@ -984,7 +1004,8 @@
         const turbineParams = {
             windSpeed: 7,      // Reduced from 10 to 7 m/s for better initial TSR
             shaftSpeed: 15,    // Increased from 10 to 15 RPM to avoid stall deadlock
-            bladePitch: 5,     // Added 5° pitch to improve initial AoA
+            bladePitch: [5, 5, 5],     // Per-blade pitch (degrees)
+            currentBladeThrusts: [],
             bladeTwist: 15, // Total twist from root to tip in degrees (DEPRECATED - use twist params below)
             twistRoot: 14,  // Twist angle at blade root (degrees)
             twistTip: 0,    // Twist angle at blade tip (degrees)
@@ -1058,11 +1079,78 @@
             samplingInterval: 0,
             speedMultiplier: 5  // Speed up rotation by this factor during fast collection
         };
+
+        // Cache the most recent Fourier results and rendered sections
+        const latestFourierResults = {
+            blade1Thrust: null,
+            blade1MomentY: null,
+            blade1MomentZ: null,
+            blade1AoA: null,
+            blade1Velocity: null,
+            blade1LiftForce: null,
+            totalThrust: null,
+            totalTorque: null,
+            totalMomentY: null,
+            totalMomentZ: null
+        };
+
+        const fourierDisplayCache = {
+            thrust: '',
+            momentY: '',
+            momentZ: '',
+            aoa: '',
+            velocity: '',
+            lift: '',
+            totalThrust: '',
+            totalTorque: '',
+            totalNodding: '',
+            totalYawing: ''
+        };
+
+        const fourierHistogramState = {
+            lastNonZeroDataByKey: {}
+        };
+
+        let fftHistogramCharts = {};
         
         // Wind farm additional turbines
         let additionalTurbines = [];
-        
+
         let timeCounter = 0;
+
+        // Ensure bladePitch array matches blade count
+        function ensureBladePitchCount() {
+            while (turbineParams.bladePitch.length < turbineParams.numBlades) {
+                const fallback = turbineParams.bladePitch[turbineParams.bladePitch.length - 1] ?? 5;
+                turbineParams.bladePitch.push(fallback);
+            }
+            if (turbineParams.bladePitch.length > turbineParams.numBlades) {
+                turbineParams.bladePitch = turbineParams.bladePitch.slice(0, turbineParams.numBlades);
+            }
+        }
+
+        function getBladePitch(bladeIndex) {
+            ensureBladePitchCount();
+            return turbineParams.bladePitch[bladeIndex] ?? turbineParams.bladePitch[0] ?? 0;
+        }
+
+        function applyBladePitchToMesh(bladeIndex) {
+            const blade = blades[bladeIndex];
+            if (!blade) return;
+            const actualPitchAngle = getBladePitch(bladeIndex) - 90; // Visual conversion
+            blade.pitchGroup.rotation.y = actualPitchAngle * Math.PI / 180;
+        }
+
+        function setBladePitch(bladeIndex, value) {
+            ensureBladePitchCount();
+            turbineParams.bladePitch[bladeIndex] = value;
+            applyBladePitchToMesh(bladeIndex);
+            resetLoadMinMax();
+            updateBladeLoads();
+            updateSpanwiseChart();
+            updateSectionDiagram();
+            resetFourierCollection();
+        }
         
         function initPlotData() {
             plotData.time = [];
@@ -2042,15 +2130,16 @@
             blades.forEach(blade => rotorGroup.remove(blade));
             blades.length = 0;
             bladeSegments.length = 0;
-            
+
+            ensureBladePitchCount();
+
             for (let i = 0; i < turbineParams.numBlades; i++) {
                 const blade = createBlade();
                 blade.rotation.x = (i * 2 * Math.PI) / turbineParams.numBlades;
-                
+
                 // Apply initial pitch angle to visual blade
-                const actualPitchAngle = turbineParams.bladePitch - 90;
-                blade.pitchGroup.rotation.y = actualPitchAngle * Math.PI / 180;
-                
+                applyBladePitchToMesh(i);
+
                 rotorGroup.add(blade);
                 blades.push(blade);
                 
@@ -2086,8 +2175,10 @@
                 scene.remove(t);
             });
             additionalTurbines = [];
-            
+
             if (!turbineParams.windFarmMode) return;
+
+            ensureBladePitchCount();
             
             // Preset positions for additional 4 turbines (main turbine at 0,0)
             const positions = [
@@ -2159,9 +2250,11 @@
                         segment.castShadow = true;
                         pitchGroup.add(segment);
                     }
-                    
+
                     bladeGroup.rotation.y = Math.PI / 2;
                     bladeGroup.rotation.x = (j * 2 * Math.PI) / turbineParams.numBlades;
+                    const farmPitch = getBladePitch(j) - 90;
+                    pitchGroup.rotation.y = farmPitch * Math.PI / 180;
                     rotorGrp.add(bladeGroup);
                 }
                 
@@ -2258,8 +2351,8 @@
                     
                     // Flow angle and angle of attack
                     const phi = Math.atan2(Vn, Vt);
-                    // Use bladePitch directly for aerodynamics (slider value is the aerodynamic angle)
-                    const aeroPitchAngle = turbineParams.bladePitch;
+                    // Use per-blade pitch directly for aerodynamics (slider value is the aerodynamic angle)
+                    const aeroPitchAngle = getBladePitch(bladeIndex);
                     const totalBladeAngle = twist + aeroPitchAngle;
                     const bladeAngleGeometric = 90 - totalBladeAngle;
                     // AoA = phi - blade angle (geometric)
@@ -2439,18 +2532,23 @@
             let totalMomentY = 0; // Nodding moment (about horizontal Y-axis in inertial frame)
             let totalMomentZ = 0; // Yawing moment (about vertical Z-axis in inertial frame)
             
+            const perBladeThrust = new Array(turbineParams.numBlades).fill(0);
+
             blades.forEach((blade, bladeIndex) => {
                 // Each blade's azimuthal position (current rotor angle + blade offset)
                 const bladeAzimuth = (rotorGroup.rotation.x + bladeIndex * 2 * Math.PI / turbineParams.numBlades);
-                
+
+                let bladeThrustTotal = 0;
+
                 blade.segments.forEach(segment => {
                     const thrust = segment.userData.thrust || 0;
                     const tangentialForce = segment.userData.tangentialForce || 0;
                     const r = segment.position.y; // Radial distance (moment arm)
-                    
+
                     totalThrust += thrust;
+                    bladeThrustTotal += thrust;
                     totalTorque += tangentialForce * r; // Torque = F_tangential * r
-                    
+
                     // Hub moments from blade loads (in inertial/fixed frame)
                     // Coordinate system: X = downwind, Y = horizontal sideways, Z = vertical up
                     // Blade segment position in YZ plane: y = r*cos(ψ), z = r*sin(ψ)
@@ -2461,6 +2559,8 @@
                     totalMomentY += thrust * r * Math.cos(bladeAzimuth);  // ✅ NODDING
                     totalMomentZ += -thrust * r * Math.sin(bladeAzimuth); // ✅ YAWING
                 });
+
+                perBladeThrust[bladeIndex] = bladeThrustTotal;
             });
             
             // Calculate total hub moment magnitude (resultant of yaw and nod moments)
@@ -2472,9 +2572,10 @@
             turbineParams.currentTotalHubMoment = totalHubMoment;
             turbineParams.currentTotalMomentY = totalMomentY;  // Store full rotor moment Y
             turbineParams.currentTotalMomentZ = totalMomentZ;  // Store full rotor moment Z
-            
+            turbineParams.currentBladeThrusts = perBladeThrust;
+
             // Update rotor loads display
-            updateRotorLoadsDisplay(totalThrust, totalTorque, totalHubMoment, totalMomentY, totalMomentZ);
+            updateRotorLoadsDisplay(totalThrust, totalTorque, totalHubMoment, totalMomentY, totalMomentZ, perBladeThrust);
             
             // Update section diagram immediately after loads are calculated (when not paused)
             if (!turbineParams.paused) {
@@ -3401,7 +3502,25 @@
             updateFourierDisplay();
         }
         
-        // Update Fourier analysis display
+        function hasNonZeroAmplitude(fourier) {
+            return fourier && fourier.some(h => Math.abs(h.amplitude) > 0);
+        }
+
+        function applyFourierSection(element, html, cacheKey, hasSignal) {
+            if (!element) return;
+            if (!hasSignal) {
+                if (fourierDisplayCache[cacheKey]) return; // Keep prior non-zero view
+                element.innerHTML = '<p style="font-size: 0.85em; color: #999;">FFT amplitudes are zero; waiting for non-zero signal...</p>';
+                return;
+            }
+            fourierDisplayCache[cacheKey] = html;
+            element.innerHTML = html;
+        }
+
+        function storeLatestFourier(key, results) {
+            latestFourierResults[key] = results;
+        }
+
         function updateFourierDisplay() {
             const thrustContent = document.getElementById('fourier-thrust-content');
             const momentYContent = document.getElementById('fourier-moment-y-content');
@@ -3449,10 +3568,10 @@
             const blade1Thrust = fourierData.bladeLift;
             const blade1MomentY = fourierData.bladeMomentY;
             const blade1MomentZ = fourierData.bladeMomentZ;
-            const totalThrust = fourierData.totalLift;
+            const totalThrust = fourierData.totalThrust;
             const totalMomentY = fourierData.totalMomentY;
             const totalMomentZ = fourierData.totalMomentZ;
-            
+
             // Perform Fourier analysis (up to 2B, where B = numBlades, minimum 3P)
             const maxHarmonic = Math.max(3, 2 * turbineParams.numBlades);
             const blade1ThrustFourier = analyzeFourier(blade1Thrust, maxHarmonic);
@@ -3461,6 +3580,14 @@
             const totalThrustFourier = analyzeFourier(totalThrust, maxHarmonic);
             const totalMomentYFourier = analyzeFourier(totalMomentY, maxHarmonic);
             const totalMomentZFourier = analyzeFourier(totalMomentZ, maxHarmonic);
+
+            storeLatestFourier('blade1Thrust', blade1ThrustFourier);
+            storeLatestFourier('blade1MomentY', blade1MomentYFourier);
+            storeLatestFourier('blade1MomentZ', blade1MomentZFourier);
+            storeLatestFourier('totalThrust', totalThrustFourier);
+            storeLatestFourier('totalTorque', analyzeFourier(fourierData.totalTorque, maxHarmonic));
+            storeLatestFourier('totalMomentY', totalMomentYFourier);
+            storeLatestFourier('totalMomentZ', totalMomentZFourier);
             
             // Calculate percentages of total
             function calculatePercent(fourier) {
@@ -3504,6 +3631,8 @@
                 return eq;
             }
             
+            const thrustHasSignal = hasNonZeroAmplitude(blade1ThrustFourier) || hasNonZeroAmplitude(totalThrustFourier);
+
             // === THRUST TAB ===
             let thrustHtml = '';
             
@@ -3542,8 +3671,11 @@
                 thrustHtml += '</tr>';
             });
             thrustHtml += '</tbody></table>';
-            
+
+            applyFourierSection(thrustContent, thrustHtml, 'thrust', thrustHasSignal);
+
             // === MOMENT Y TAB === (Shows YAWING, which is Z data)
+            const momentYHasSignal = hasNonZeroAmplitude(blade1MomentZFourier) || hasNonZeroAmplitude(totalMomentZFourier);
             let momentYHtml = '';
             
             // Blade 1 Yawing Moment
@@ -3581,8 +3713,11 @@
                 momentYHtml += '</tr>';
             });
             momentYHtml += '</tbody></table>';
-            
+
+            applyFourierSection(momentYContent, momentYHtml, 'momentY', momentYHasSignal);
+
             // === MOMENT Z TAB === (Shows NODDING, which is Y data)
+            const momentZHasSignal = hasNonZeroAmplitude(blade1MomentYFourier) || hasNonZeroAmplitude(totalMomentYFourier);
             let momentZHtml = '';
             
             // Blade 1 Nodding Moment
@@ -3620,15 +3755,14 @@
                 momentZHtml += '</tr>';
             });
             momentZHtml += '</tbody></table>';
-            
-            thrustContent.innerHTML = thrustHtml;
-            momentYContent.innerHTML = momentYHtml;
-            momentZContent.innerHTML = momentZHtml;
+
+            applyFourierSection(momentZContent, momentZHtml, 'momentZ', momentZHasSignal);
             
             // === AOA TAB === (Blade data only, no total)
             const blade1AoA = fourierData.bladeAoA;
             const blade1AoAFourier = analyzeFourier(blade1AoA, maxHarmonic);
             const blade1AoAWithPercent = calculatePercent(blade1AoAFourier);
+            storeLatestFourier('blade1AoA', blade1AoAFourier);
             
             let aoaHtml = '';
             aoaHtml += '<h5 style="margin: 10px 0 5px 0; font-size: 0.95em;">Blade 1 Angle of Attack (rotating/blade frame)</h5>';
@@ -3647,12 +3781,13 @@
                 aoaHtml += '</tr>';
             });
             aoaHtml += '</tbody></table>';
-            aoaContent.innerHTML = aoaHtml;
+            applyFourierSection(aoaContent, aoaHtml, 'aoa', hasNonZeroAmplitude(blade1AoAFourier));
             
             // === VELOCITY TAB === (Blade data only, no total)
             const blade1Velocity = fourierData.bladeVelocity;
             const blade1VelocityFourier = analyzeFourier(blade1Velocity, maxHarmonic);
             const blade1VelocityWithPercent = calculatePercent(blade1VelocityFourier);
+            storeLatestFourier('blade1Velocity', blade1VelocityFourier);
             
             let velocityHtml = '';
             velocityHtml += '<h5 style="margin: 10px 0 5px 0; font-size: 0.95em;">Blade 1 Total Velocity (rotating/blade frame)</h5>';
@@ -3671,12 +3806,13 @@
                 velocityHtml += '</tr>';
             });
             velocityHtml += '</tbody></table>';
-            velocityContent.innerHTML = velocityHtml;
+            applyFourierSection(velocityContent, velocityHtml, 'velocity', hasNonZeroAmplitude(blade1VelocityFourier));
             
             // === LIFT FORCE TAB === (Blade data only, no total)
             const blade1LiftForce = fourierData.bladeLiftForce;
             const blade1LiftForceFourier = analyzeFourier(blade1LiftForce, maxHarmonic);
             const blade1LiftForceWithPercent = calculatePercent(blade1LiftForceFourier);
+            storeLatestFourier('blade1LiftForce', blade1LiftForceFourier);
             
             let liftHtml = '';
             liftHtml += '<h5 style="margin: 10px 0 5px 0; font-size: 0.95em;">Blade 1 Lift Force (rotating/blade frame)</h5>';
@@ -3695,7 +3831,7 @@
                 liftHtml += '</tr>';
             });
             liftHtml += '</tbody></table>';
-            liftContent.innerHTML = liftHtml;
+            applyFourierSection(liftContent, liftHtml, 'lift', hasNonZeroAmplitude(blade1LiftForceFourier));
             
             // === TOTAL LOADS FOURIER ANALYSIS ===
             const totalThrustContent = document.getElementById('fourier-total-thrust-content');
@@ -3709,17 +3845,27 @@
                 const totalRotorTorque = fourierData.totalTorque;
                 const totalRotorNoddingMoment = fourierData.totalMomentY;  // Use My (nodding)
                 const totalRotorYawingMoment = fourierData.totalMomentZ;  // Use Mz (yawing)
-                
+
                 const totalRotorThrustFourier = analyzeFourier(totalRotorThrust, maxHarmonic);
                 const totalRotorTorqueFourier = analyzeFourier(totalRotorTorque, maxHarmonic);
                 const totalRotorNoddingMomentFourier = analyzeFourier(totalRotorNoddingMoment, maxHarmonic);
                 const totalRotorYawingMomentFourier = analyzeFourier(totalRotorYawingMoment, maxHarmonic);
+
+                storeLatestFourier('totalThrust', totalRotorThrustFourier);
+                storeLatestFourier('totalTorque', totalRotorTorqueFourier);
+                storeLatestFourier('totalMomentY', totalRotorNoddingMomentFourier);
+                storeLatestFourier('totalMomentZ', totalRotorYawingMomentFourier);
                 
                 const totalRotorThrustWithPercent = calculatePercent(totalRotorThrustFourier);
                 const totalRotorTorqueWithPercent = calculatePercent(totalRotorTorqueFourier);
                 const totalRotorNoddingMomentWithPercent = calculatePercent(totalRotorNoddingMomentFourier);
                 const totalRotorYawingMomentWithPercent = calculatePercent(totalRotorYawingMomentFourier);
                 
+                const totalThrustHasSignal = hasNonZeroAmplitude(totalRotorThrustFourier);
+                const totalTorqueHasSignal = hasNonZeroAmplitude(totalRotorTorqueFourier);
+                const totalNoddingHasSignal = hasNonZeroAmplitude(totalRotorNoddingMomentFourier);
+                const totalYawingHasSignal = hasNonZeroAmplitude(totalRotorYawingMomentFourier);
+
                 // Total Thrust
                 let totalThrustHtml = createFourierEquation('Total Thrust', totalRotorThrustFourier);
                 totalThrustHtml += `<div style="margin-top: 10px;">`;
@@ -3731,8 +3877,8 @@
                     totalThrustHtml += `</div>`;
                 });
                 totalThrustHtml += `</div>`;
-                totalThrustContent.innerHTML = totalThrustHtml;
-                
+                applyFourierSection(totalThrustContent, totalThrustHtml, 'totalThrust', totalThrustHasSignal);
+
                 // Total Torque
                 let totalTorqueHtml = createFourierEquation('Total Torque', totalRotorTorqueFourier);
                 totalTorqueHtml += `<div style="margin-top: 10px;">`;
@@ -3744,8 +3890,8 @@
                     totalTorqueHtml += `</div>`;
                 });
                 totalTorqueHtml += `</div>`;
-                totalTorqueContent.innerHTML = totalTorqueHtml;
-                
+                applyFourierSection(totalTorqueContent, totalTorqueHtml, 'totalTorque', totalTorqueHasSignal);
+
                 // Nodding Moment
                 let noddingMomentHtml = createFourierEquation('Nodding Moment', totalRotorNoddingMomentFourier);
                 noddingMomentHtml += `<div style="margin-top: 10px;">`;
@@ -3757,8 +3903,8 @@
                     noddingMomentHtml += `</div>`;
                 });
                 noddingMomentHtml += `</div>`;
-                noddingMomentContent.innerHTML = noddingMomentHtml;
-                
+                applyFourierSection(noddingMomentContent, noddingMomentHtml, 'totalNodding', totalNoddingHasSignal);
+
                 // Yawing Moment
                 let yawingMomentHtml = createFourierEquation('Yawing Moment', totalRotorYawingMomentFourier);
                 yawingMomentHtml += `<div style="margin-top: 10px;">`;
@@ -3770,8 +3916,34 @@
                     yawingMomentHtml += `</div>`;
                 });
                 yawingMomentHtml += `</div>`;
-                yawingMomentContent.innerHTML = yawingMomentHtml;
+                applyFourierSection(yawingMomentContent, yawingMomentHtml, 'totalYawing', totalYawingHasSignal);
             }
+
+            updateFourierHistograms();
+        }
+
+        function updateFourierHistograms() {
+            Object.entries(fftHistogramCharts).forEach(([key, chart]) => {
+                const cached = fourierHistogramState.lastNonZeroDataByKey[key];
+                const fourier = latestFourierResults[key] || cached;
+                if (!fourier || fourier.length === 0) return;
+
+                if (!hasNonZeroAmplitude(fourier)) {
+                    if (cached) {
+                        chart.data.labels = cached.map(h => `${h.harmonic}P`);
+                        chart.data.datasets[0].data = cached.map(h => Number(Math.abs(h.amplitude).toFixed(2)));
+                        chart.update('none');
+                        return;
+                    }
+                    return;
+                }
+
+                fourierHistogramState.lastNonZeroDataByKey[key] = fourier;
+
+                chart.data.labels = fourier.map(h => `${h.harmonic}P`);
+                chart.data.datasets[0].data = fourier.map(h => Number(Math.abs(h.amplitude).toFixed(2)));
+                chart.update('none');
+            });
         }
         
         // Rebuild charts when blade count changes
@@ -4783,19 +4955,42 @@
             }
         });
         
-        document.getElementById('blade-pitch').addEventListener('input', (e) => {
-            turbineParams.bladePitch = parseFloat(e.target.value);
-            document.getElementById('blade-pitch-value').textContent = turbineParams.bladePitch.toFixed(1);
-            // Update visual blade pitch
-            // Convert from new convention: 0° = in disc, 90° = feathered
-            // To rotation: subtract from 90° to get actual pitch angle
-            const actualPitchAngle = turbineParams.bladePitch - 90;
-            blades.forEach(blade => {
-                blade.pitchGroup.rotation.y = actualPitchAngle * Math.PI / 180;
+        function renderBladePitchControls() {
+            const container = document.getElementById('blade-pitch-slider-container');
+            if (!container) return;
+
+            ensureBladePitchCount();
+
+            container.innerHTML = '';
+
+            turbineParams.bladePitch.forEach((pitch, index) => {
+                const wrapper = document.createElement('div');
+                wrapper.style.marginBottom = '10px';
+
+                const label = document.createElement('label');
+                label.innerHTML = `Blade ${index + 1} Pitch: <span class="value-display" id="blade-pitch-value-${index}">${pitch.toFixed(1)}</span>°`;
+
+                const slider = document.createElement('input');
+                slider.type = 'range';
+                slider.min = '-10';
+                slider.max = '90';
+                slider.step = '1';
+                slider.value = pitch;
+                slider.id = `blade-pitch-${index}`;
+                slider.addEventListener('input', (e) => {
+                    const val = parseFloat(e.target.value);
+                    const valueDisplay = document.getElementById(`blade-pitch-value-${index}`);
+                    if (valueDisplay) valueDisplay.textContent = val.toFixed(1);
+                    setBladePitch(index, val);
+                    resetLoadMinMax(); // Reset load min/max tracking
+                    debouncedSaveState();
+                });
+
+                wrapper.appendChild(label);
+                wrapper.appendChild(slider);
+                container.appendChild(wrapper);
             });
-            resetLoadMinMax(); // Reset load min/max tracking
-            updateSectionDiagram(); // Immediately update section analysis
-        });
+        }
         
         // Twist Settings Modal Controls
         const twistModal = document.getElementById('twist-modal');
@@ -5239,6 +5434,55 @@
             },
             plugins: [currentPositionPlugin, tdcMarkerPlugin]
         });
+
+        const fftHistogramConfigs = {
+            totalThrust: { canvasId: 'thrust-fft-histogram', label: 'Total Thrust' },
+            totalTorque: { canvasId: 'torque-fft-histogram', label: 'Total Torque' },
+            totalMomentY: { canvasId: 'nodding-fft-histogram', label: 'Total Nodding Moment' },
+            totalMomentZ: { canvasId: 'yawing-fft-histogram', label: 'Total Yawing Moment' }
+        };
+
+        Object.entries(fftHistogramConfigs).forEach(([key, config]) => {
+            const canvas = document.getElementById(config.canvasId);
+            if (!canvas) return;
+
+            const ctx = canvas.getContext('2d');
+            fftHistogramCharts[key] = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        label: `${config.label} Amplitude`,
+                        data: [],
+                        backgroundColor: 'rgba(102, 126, 234, 0.6)',
+                        borderColor: 'rgba(102, 126, 234, 1)',
+                        borderWidth: 1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            callbacks: {
+                                label: (ctx) => `Amplitude: ${ctx.parsed.y}`
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            title: { display: true, text: 'Harmonic (nP)' }
+                        },
+                        y: {
+                            beginAtZero: true,
+                            title: { display: true, text: 'Amplitude' }
+                        }
+                    }
+                }
+            });
+        });
         
         // Function to update total loads charts
         function updateTotalLoadsCharts() {
@@ -5315,14 +5559,23 @@
         }
         
         // Function to update rotor loads display (for yaw/nod moment text)
-        function updateRotorLoadsDisplay(thrust, torque, hubMoment, yawMoment, nodMoment) {
+        function updateRotorLoadsDisplay(thrust, torque, hubMoment, yawMoment, nodMoment, perBladeThrust = []) {
             // Format numbers with appropriate precision
             const formatValue = (val) => {
                 if (Math.abs(val) < 1000) return val.toFixed(1);
                 if (Math.abs(val) < 1000000) return (val / 1000).toFixed(1) + 'k';
                 return (val / 1000000).toFixed(2) + 'M';
             };
-            
+
+            // Update per-blade thrust breakdown (helps diagnose asymmetric pitch effects)
+            const thrustList = document.getElementById('blade-thrust-breakdown');
+            if (thrustList) {
+                const source = perBladeThrust.length ? perBladeThrust : turbineParams.currentBladeThrusts;
+                thrustList.innerHTML = source.map((val, idx) => {
+                    return `<div><strong>Blade ${idx + 1}:</strong> ${formatValue(val)} N</div>`;
+                }).join('');
+            }
+
             // Update charts
             updateTotalLoadsCharts();
         }
@@ -5391,6 +5644,8 @@
         document.getElementById('num-blades').addEventListener('input', (e) => {
             turbineParams.numBlades = parseInt(e.target.value);
             document.getElementById('num-blades-value').textContent = turbineParams.numBlades;
+            ensureBladePitchCount();
+            renderBladePitchControls();
             updateBladeCount();
         });
         
@@ -5707,11 +5962,11 @@
                 
                 // Blade 1 azimuth (starts at 0)
                 const azimuth1 = angle;
-                const thrust1 = calculateThrustAtAzimuth(azimuth1, targetRadius, chord, omega, windSpeedAxial, windSpeedTangential, inflowRadians);
+                const thrust1 = calculateThrustAtAzimuth(azimuth1, targetRadius, chord, omega, windSpeedAxial, windSpeedTangential, inflowRadians, 0);
                 
                 // Blade 2 azimuth (180 degrees offset)
                 const azimuth2 = angle + Math.PI;
-                const thrust2 = calculateThrustAtAzimuth(azimuth2, targetRadius, chord, omega, windSpeedAxial, windSpeedTangential, inflowRadians);
+                const thrust2 = calculateThrustAtAzimuth(azimuth2, targetRadius, chord, omega, windSpeedAxial, windSpeedTangential, inflowRadians, 1);
                 
                 // Position descriptions
                 const pos1 = getPositionDescription((azimuth1 * 180 / Math.PI) % 360);
@@ -6028,7 +6283,7 @@
             
             // Get actual pitch angle (convert from 0=disc, 90=feathered convention)
             // For 3D visualization, we need to convert, but for aerodynamics, use bladePitch directly
-            const actualPitchAngle = turbineParams.bladePitch; // Use slider value directly for aerodynamics
+            const actualPitchAngle = getBladePitch(0); // Use blade 1 pitch for aerodynamics
             const totalBladeAngle = twist + actualPitchAngle; // Total rotation of blade for aerodynamics
             const angleRad = -totalBladeAngle * Math.PI / 180; // Negative for correct direction
             
@@ -6408,7 +6663,7 @@
         }
         
         // Helper function to calculate thrust at a given azimuth
-        function calculateThrustAtAzimuth(azimuth, r, chord, omega, windSpeedAxial, windSpeedTangential, inflowRadians) {
+        function calculateThrustAtAzimuth(azimuth, r, chord, omega, windSpeedAxial, windSpeedTangential, inflowRadians, bladeIndex = 0) {
             // Blade twist distribution (optimal for constant AoA)
             // Varies inversely with radius to maintain constant flow angle
             const r_norm = (r - turbineParams.hubRadius) / (turbineParams.bladeRadius - turbineParams.hubRadius);
@@ -6438,8 +6693,8 @@
             
             // Flow angle and angle of attack
             const phi = Math.atan2(Vn, Vt);
-            // Use bladePitch directly for aerodynamics (slider value is the aerodynamic angle)
-            const aeroPitchAngle = turbineParams.bladePitch;
+            // Use per-blade pitch directly for aerodynamics (slider value is the aerodynamic angle)
+            const aeroPitchAngle = getBladePitch(bladeIndex);
             const totalBladeAngle = twist + aeroPitchAngle;
             const bladeAngleGeometric = 90 - totalBladeAngle;
             // AoA = phi - blade angle (geometric)
@@ -6648,7 +6903,8 @@
             // Save main parameters
             params.set('windSpeed', turbineParams.windSpeed);
             params.set('shaftSpeed', turbineParams.shaftSpeed);
-            params.set('bladePitch', turbineParams.bladePitch);
+            ensureBladePitchCount();
+            params.set('bladePitch', turbineParams.bladePitch.join(','));
             params.set('twistRoot', turbineParams.twistRoot);
             params.set('twistTip', turbineParams.twistTip);
             params.set('numBlades', turbineParams.numBlades);
@@ -6695,9 +6951,15 @@
                 turbineParams.angularVelocity = turbineParams.shaftSpeed * 2 * Math.PI / 60;
             }
             if (params.has('bladePitch')) {
-                turbineParams.bladePitch = parseFloat(params.get('bladePitch'));
-                document.getElementById('blade-pitch').value = turbineParams.bladePitch;
-                document.getElementById('blade-pitch-value').textContent = turbineParams.bladePitch.toFixed(1);
+                const bladePitchParam = params.get('bladePitch');
+                if (bladePitchParam && bladePitchParam.includes(',')) {
+                    turbineParams.bladePitch = bladePitchParam.split(',').map(v => parseFloat(v)).filter(v => !Number.isNaN(v));
+                } else {
+                    const singlePitch = parseFloat(bladePitchParam);
+                    if (!Number.isNaN(singlePitch)) {
+                        turbineParams.bladePitch = Array(Math.max(1, turbineParams.numBlades)).fill(singlePitch);
+                    }
+                }
             }
             if (params.has('twistRoot')) {
                 turbineParams.twistRoot = parseFloat(params.get('twistRoot'));
@@ -6797,6 +7059,10 @@
                 turbineParams.debugSinusoid = true;
                 document.getElementById('debug-sinusoid').checked = true;
             }
+
+            ensureBladePitchCount();
+            renderBladePitchControls();
+            blades.forEach((_, i) => applyBladePitchToMesh(i));
             
             // Rebuild if blade count or camber changed
             if (params.has('numBlades') || params.has('debugCamber')) {

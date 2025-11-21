@@ -1,5 +1,8 @@
 {
   "dependencies": {
     "puppeteer": "^24.25.0"
+  },
+  "scripts": {
+    "test": "node tests/run-page-smoke.js"
   }
 }
